@@ -3,6 +3,8 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
@@ -2331,4 +2333,389 @@ func TestIPAdvertisementFor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func runL2Election(t *testing.T, cfg *config.Config, svc *v1.Service, eps []discovery.EndpointSlice, speakerMap map[string]bool, nodes map[string]*v1.Node, lbIP net.IP) []string {
+	t.Helper()
+	fakeSL := &fakeSpeakerList{speakers: speakerMap}
+	l := log.NewNopLogger()
+	var winners []string
+	for nodeName := range speakerMap {
+		c, err := newController(controllerConfig{
+			MyNode:  nodeName,
+			Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+			SList:   fakeSL,
+			bgpType: bgpNative,
+		})
+		if err != nil {
+			t.Fatalf("new controller: %s", err)
+		}
+		c.client = &testK8S{t: t}
+		if c.SetConfig(l, cfg) == controllers.SyncStateError {
+			t.Fatalf("SetConfig failed")
+		}
+		if c.protocolHandlers[config.Layer2].ShouldAnnounce(l, "svc1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc, eps, nodes) == "" {
+			winners = append(winners, nodeName)
+		}
+	}
+	return winners
+}
+
+func hashWinner(ip string, candidates ...string) string {
+	winner := candidates[0]
+	wh := sha256.Sum256([]byte(winner + "#" + ip))
+	for _, c := range candidates[1:] {
+		ch := sha256.Sum256([]byte(c + "#" + ip))
+		if bytes.Compare(ch[:], wh[:]) < 0 {
+			winner = c
+			wh = ch
+		}
+	}
+	return winner
+}
+
+func TestPreferredScoresForService(t *testing.T) {
+	tests := []struct {
+		desc string
+		ads  []*config.L2Advertisement
+		want map[string]int64
+	}{
+		{
+			desc: "nil ads",
+		},
+		{
+			desc: "ads without preferences",
+			ads:  []*config.L2Advertisement{{Nodes: map[string]bool{"a": true}}},
+		},
+		{
+			desc: "preferences across ads sum",
+			ads: []*config.L2Advertisement{
+				{Nodes: map[string]bool{"a": true, "b": true}, PreferredNodes: map[string]int64{"a": 70}},
+				{Nodes: map[string]bool{"a": true, "b": true}, PreferredNodes: map[string]int64{"a": 30, "b": 50}},
+			},
+			want: map[string]int64{"a": 100, "b": 50},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := preferredScoresForService(tc.ads)
+			if len(got) != len(tc.want) {
+				t.Fatalf("size mismatch: want %d got %d (%v)", len(tc.want), len(got), got)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Fatalf("score[%s]: want %d got %d", k, v, got[k])
+				}
+			}
+		})
+	}
+}
+
+func TestShouldAnnouncePreferredNode(t *testing.T) {
+	lbIP := net.ParseIP("10.20.30.1")
+
+	tests := []struct {
+		desc       string
+		speakerMap map[string]bool
+		svc        *v1.Service
+		eps        []discovery.EndpointSlice
+		ad         *config.L2Advertisement
+		wantWinner string
+	}{
+		{
+			desc:       "preferred node with highest score wins",
+			speakerMap: map[string]bool{"edge-a": true, "edge-b": true, "worker-a": true, "worker-b": true},
+			svc: &v1.Service{
+				Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			eps: []discovery.EndpointSlice{{
+				Endpoints: []discovery.Endpoint{{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("worker-a"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				}},
+			}},
+			ad: &config.L2Advertisement{
+				Nodes:          map[string]bool{"edge-a": true, "edge-b": true, "worker-a": true, "worker-b": true},
+				PreferredNodes: map[string]int64{"edge-a": 100},
+				AllInterfaces:  true,
+			},
+			wantWinner: "edge-a",
+		},
+		{
+			// ETP:Local drops nodes without local ready endpoints before preference
+			// scoring. A preferred node without endpoints must lose to an unpreferred
+			// node that has them.
+			desc:       "ETP Local drops preferred node without local endpoints",
+			speakerMap: map[string]bool{"preferred-a": true, "worker-a": true},
+			svc: &v1.Service{
+				Spec: v1.ServiceSpec{
+					Type:                  "LoadBalancer",
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			eps: []discovery.EndpointSlice{{
+				Endpoints: []discovery.Endpoint{{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("worker-a"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				}},
+			}},
+			ad: &config.L2Advertisement{
+				Nodes:          map[string]bool{"preferred-a": true, "worker-a": true},
+				PreferredNodes: map[string]int64{"preferred-a": 100},
+				AllInterfaces:  true,
+			},
+			wantWinner: "worker-a",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := &config.Config{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
+					"default": {
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: []*config.L2Advertisement{tc.ad},
+					},
+				}},
+			}
+			nodes := map[string]*v1.Node{}
+			for n := range tc.speakerMap {
+				nodes[n] = &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: n}}
+			}
+			winners := runL2Election(t, cfg, tc.svc, tc.eps, tc.speakerMap, nodes, lbIP)
+			if len(winners) != 1 {
+				t.Fatalf("expected exactly one announcer, got %d: %v", len(winners), winners)
+			}
+			if winners[0] != tc.wantWinner {
+				t.Fatalf("expected %q to announce, got %q", tc.wantWinner, winners[0])
+			}
+		})
+	}
+}
+
+func TestShouldAnnounceSplitBrainWithMixedAds(t *testing.T) {
+	// Ad1 covers edges and carries the preference. Ad2 covers everyone with none.
+	// If scoring used a node-filtered ad set, worker speakers would disagree with
+	// edge speakers. The adPoison ad has ServiceSelectors that must not match svc.
+	// Otherwise worker-a's 1000 would outscore edge-a's 100.
+	speakerMap := map[string]bool{"edge-a": true, "worker-a": true}
+	adEdge := &config.L2Advertisement{
+		Nodes:          map[string]bool{"edge-a": true},
+		PreferredNodes: map[string]int64{"edge-a": 100},
+		AllInterfaces:  true,
+	}
+	adAll := &config.L2Advertisement{
+		Nodes:         map[string]bool{"edge-a": true, "worker-a": true},
+		AllInterfaces: true,
+	}
+	adPoison := &config.L2Advertisement{
+		Nodes:            map[string]bool{"edge-a": true, "worker-a": true},
+		PreferredNodes:   map[string]int64{"worker-a": 1000},
+		ServiceSelectors: []labels.Selector{selector("app=does-not-match")},
+		AllInterfaces:    true,
+	}
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: []*config.L2Advertisement{adEdge, adAll, adPoison},
+			},
+		}},
+	}
+	svc := &v1.Service{
+		Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+		Status: statusAssigned("10.20.30.1"),
+	}
+	eps := []discovery.EndpointSlice{{
+		Endpoints: []discovery.Endpoint{{
+			Addresses:  []string{"2.3.4.5"},
+			NodeName:   ptr.To("worker-a"),
+			Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}}
+
+	nodes := map[string]*v1.Node{
+		"edge-a":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-a"}},
+		"worker-a": {ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+	}
+	winners := runL2Election(t, cfg, svc, eps, speakerMap, nodes, net.ParseIP("10.20.30.1"))
+	if len(winners) != 1 || winners[0] != "edge-a" {
+		t.Fatalf("edge-a must win due to preference score; got %v", winners)
+	}
+}
+
+func TestShouldAnnounceHashTieBreak(t *testing.T) {
+	lbIP := net.ParseIP("10.20.30.1")
+	svc := &v1.Service{
+		Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+		Status: statusAssigned("10.20.30.1"),
+	}
+
+	tests := []struct {
+		desc       string
+		speakerMap map[string]bool
+		ad         *config.L2Advertisement
+		epsNode    string
+	}{
+		{
+			desc:       "no preferences falls back to sha256 hash",
+			speakerMap: map[string]bool{"iris1": true, "iris2": true},
+			ad: &config.L2Advertisement{
+				Nodes:         map[string]bool{"iris1": true, "iris2": true},
+				AllInterfaces: true,
+			},
+			epsNode: "iris1",
+		},
+		{
+			desc:       "equal non-zero scores fall through to sha256 hash",
+			speakerMap: map[string]bool{"node-a": true, "node-b": true},
+			ad: &config.L2Advertisement{
+				Nodes:          map[string]bool{"node-a": true, "node-b": true},
+				PreferredNodes: map[string]int64{"node-a": 100, "node-b": 100},
+				AllInterfaces:  true,
+			},
+			epsNode: "node-a",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := &config.Config{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
+					"default": {
+						CIDR:             []*net.IPNet{ipnet("10.20.30.1/32")},
+						L2Advertisements: []*config.L2Advertisement{tc.ad},
+					},
+				}},
+			}
+			eps := []discovery.EndpointSlice{{
+				Endpoints: []discovery.Endpoint{{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To(tc.epsNode),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				}},
+			}}
+			names := make([]string, 0, len(tc.speakerMap))
+			nodes := map[string]*v1.Node{}
+			for n := range tc.speakerMap {
+				names = append(names, n)
+				nodes[n] = &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: n}}
+			}
+			expected := hashWinner("10.20.30.1", names...)
+			winners := runL2Election(t, cfg, svc, eps, tc.speakerMap, nodes, lbIP)
+			if len(winners) != 1 {
+				t.Fatalf("expected exactly one announcer, got %d: %v", len(winners), winners)
+			}
+			if winners[0] != expected {
+				t.Fatalf("expected sha256 leader %q, got %q", expected, winners[0])
+			}
+		})
+	}
+}
+
+func TestShouldAnnouncePreferredNodeFailover(t *testing.T) {
+	// Three failover stages: preferred node pruned, preferred node returns,
+	// all preferred unavailable. Each stage swaps the speakerMap and re-elects.
+	lbIP := net.ParseIP("10.20.30.1")
+	ad := &config.L2Advertisement{
+		Nodes: map[string]bool{
+			"edge-a":   true,
+			"edge-b":   true,
+			"worker-a": true,
+		},
+		PreferredNodes: map[string]int64{
+			"edge-a": 100,
+			"edge-b": 100,
+		},
+		AllInterfaces: true,
+	}
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: []*config.L2Advertisement{ad},
+			},
+		}},
+	}
+	svc := &v1.Service{
+		Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+		Status: statusAssigned("10.20.30.1"),
+	}
+	eps := []discovery.EndpointSlice{{
+		Endpoints: []discovery.Endpoint{{
+			Addresses:  []string{"2.3.4.5"},
+			NodeName:   ptr.To("worker-a"),
+			Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}}
+	allNodes := map[string]*v1.Node{
+		"edge-a":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-a"}},
+		"edge-b":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-b"}},
+		"worker-a": {ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+	}
+
+	t.Run("preferred node pruned leaves remaining preferred as winner", func(t *testing.T) {
+		speakerMap := map[string]bool{"edge-b": true, "worker-a": true}
+		winners := runL2Election(t, cfg, svc, eps, speakerMap, allNodes, lbIP)
+		if len(winners) != 1 || winners[0] != "edge-b" {
+			t.Fatalf("expected edge-b (remaining preferred) to announce, got %v", winners)
+		}
+	})
+
+	t.Run("preferred node returns and reclaims via sha256 tie-break", func(t *testing.T) {
+		speakerMap := map[string]bool{"edge-a": true, "edge-b": true, "worker-a": true}
+		expected := hashWinner("10.20.30.1", "edge-a", "edge-b")
+		winners := runL2Election(t, cfg, svc, eps, speakerMap, allNodes, lbIP)
+		if len(winners) != 1 || winners[0] != expected {
+			t.Fatalf("expected sha256 tie-break winner %q among preferred nodes, got %v", expected, winners)
+		}
+	})
+
+	t.Run("all preferred unavailable falls through to hash across zero-score survivors", func(t *testing.T) {
+		speakerMap := map[string]bool{"worker-a": true, "worker-b": true}
+		adAllWorkers := &config.L2Advertisement{
+			Nodes: map[string]bool{
+				"edge-a":   true,
+				"edge-b":   true,
+				"worker-a": true,
+				"worker-b": true,
+			},
+			PreferredNodes: map[string]int64{
+				"edge-a": 100,
+				"edge-b": 100,
+			},
+			AllInterfaces: true,
+		}
+		cfgWorkers := &config.Config{
+			Pools: &config.Pools{ByName: map[string]*config.Pool{
+				"default": {
+					CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+					L2Advertisements: []*config.L2Advertisement{adAllWorkers},
+				},
+			}},
+		}
+		workerEps := []discovery.EndpointSlice{{
+			Endpoints: []discovery.Endpoint{{
+				Addresses:  []string{"2.3.4.5"},
+				NodeName:   ptr.To("worker-a"),
+				Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+			}},
+		}}
+		nodes := map[string]*v1.Node{
+			"edge-a":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-a"}},
+			"edge-b":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-b"}},
+			"worker-a": {ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+			"worker-b": {ObjectMeta: metav1.ObjectMeta{Name: "worker-b"}},
+		}
+		expected := hashWinner("10.20.30.1", "worker-a", "worker-b")
+		winners := runL2Election(t, cfgWorkers, svc, workerEps, speakerMap, nodes, lbIP)
+		if len(winners) != 1 || winners[0] != expected {
+			t.Fatalf("expected sha256 winner %q among zero-score survivors, got %v", expected, winners)
+		}
+	})
 }

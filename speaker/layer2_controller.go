@@ -107,12 +107,18 @@ func (c *layer2Controller) ShouldAnnounce(l log.Logger, name string, toAnnounce 
 
 	level.Debug(l).Log("event", "shouldannounce", "protocol", "l2", "nodes", availableNodes, "service", name)
 
+	scores := preferredScoresForService(adsForService)
+
 	// Using the first IP should work for both single and dual stack.
 	ipString := toAnnounce[0].String()
 	// Sort the slice by the hash of node + load balancer ips. This
 	// produces an ordering of ready nodes that is unique to all the services
 	// with the same ip.
 	sort.Slice(availableNodes, func(i, j int) bool {
+		si, sj := scores[availableNodes[i]], scores[availableNodes[j]]
+		if si != sj {
+			return si > sj
+		}
 		hi := sha256.Sum256([]byte(availableNodes[i] + "#" + ipString))
 		hj := sha256.Sum256([]byte(availableNodes[j] + "#" + ipString))
 
@@ -175,6 +181,22 @@ func (c *layer2Controller) SetNode(l log.Logger, n *v1.Node) error {
 
 func (c *layer2Controller) SetEventCallback(callback func(interface{})) {
 	// Do nothing
+}
+
+// preferredScoresForService sums per-advertisement preference weights across
+// all ads applicable to a service. Returns nil when no ad carries preferences.
+// Callers must tolerate a nil map, where reads return zero.
+func preferredScoresForService(ads []*config.L2Advertisement) map[string]int64 {
+	var scores map[string]int64
+	for _, ad := range ads {
+		for node, weight := range ad.PreferredNodes {
+			if scores == nil {
+				scores = make(map[string]int64, len(ad.PreferredNodes))
+			}
+			scores[node] += weight
+		}
+	}
+	return scores
 }
 
 func ipAdvertisementFor(ip net.IP, l2Advertisements []*config.L2Advertisement) layer2.IPAdvertisement {

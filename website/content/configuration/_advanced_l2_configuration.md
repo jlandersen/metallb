@@ -71,6 +71,59 @@ and `NodeB`, and only one of those node will be chosen to expose the IP.
 
 On the other hand, IPs coming from `second-pool` will be exposed always via `NodeC`.
 
+### Prefer specific nodes for L2 announcements
+
+`nodeSelectors` is a hard filter: nodes outside the selector cannot announce at all. When you
+want a soft preference instead, for example "announce from the edge nodes when possible, fall
+back to workers otherwise", use `preferredNodeSelectors`.
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: prefer-edge
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - production-pool
+  preferredNodeSelectors:
+  - weight: 100
+    preference:
+      matchLabels:
+        node-role: edge
+```
+
+Nodes matching `node-role: edge` score 100 and win the election. All other nodes score 0 and
+serve as failover when no preferred node is available. Within the same score, the usual
+`sha256(node + "#" + ip)` hash decides, so ordering is deterministic.
+
+Weights can be combined. A node matching multiple selectors sums their weights, and multiple
+`L2Advertisement` objects targeting the same pool sum per-ad scores for a service.
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: tiered-zones
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - production-pool
+  preferredNodeSelectors:
+  - weight: 100
+    preference:
+      matchLabels:
+        zone: primary
+  - weight: 50
+    preference:
+      matchLabels:
+        zone: secondary
+```
+
+Preferences are scoped to the advertisement's own `nodeSelectors`. An ad with no
+`nodeSelectors` scores every node. An ad with `nodeSelectors` never raises the score of nodes
+outside its eligible set.
+
 ### Specify network interfaces that LB IP can be announced from
 
 In L2 mode, by default a metallb speaker announces the LoadBalancer IP from all the network interfaces of a node. We can use `interfaces` in `L2Advertisement` to select a subset of them.

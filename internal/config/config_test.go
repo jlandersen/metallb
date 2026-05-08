@@ -3924,6 +3924,36 @@ func TestContainsAdvertisement(t *testing.T) {
 			},
 			expect: false,
 		},
+		{
+			desc: "Ads carrying preferences never dedupe so speaker can sum weights",
+			advs: []*L2Advertisement{
+				{
+					Nodes:          map[string]bool{"edge-a": true},
+					AllInterfaces:  true,
+					PreferredNodes: map[string]int64{"edge-a": 50},
+				},
+			},
+			toCheck: &L2Advertisement{
+				Nodes:          map[string]bool{"edge-a": true},
+				AllInterfaces:  true,
+				PreferredNodes: map[string]int64{"edge-a": 50},
+			},
+			expect: false,
+		},
+		{
+			desc: "Identical ads without preferences still dedupe",
+			advs: []*L2Advertisement{
+				{
+					Nodes:         map[string]bool{"a": true},
+					AllInterfaces: true,
+				},
+			},
+			toCheck: &L2Advertisement{
+				Nodes:         map[string]bool{"a": true},
+				AllInterfaces: true,
+			},
+			expect: true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
